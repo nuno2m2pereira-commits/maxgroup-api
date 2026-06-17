@@ -1,9 +1,14 @@
 [build]
 builder = "NIXPACKS"
+buildCommand = "npm install && npx puppeteer browsers install chrome"
 
 [deploy]
-startCommand = "npm start"
+startCommand = "node server.js"
 healthcheckPath = "/"
-healthcheckTimeout = 30
+healthcheckTimeout = 60
 restartPolicyType = "ON_FAILURE"
 restartPolicyMaxRetries = 3
+
+[[variables]]
+PUPPETEER_SKIP_CHROMIUM_DOWNLOAD = "false"
+PUPPETEER_CACHE_DIR = "/root/.cache/puppeteer"
