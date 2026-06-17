@@ -13,6 +13,7 @@ const PORT = process.env.PORT || 3000;
 app.set('trust proxy', 1);
 
 app.use(helmet({ contentSecurityPolicy: false }));
+app.set('trust proxy', 1); // Required for Railway/reverse proxy
 app.use(cors({ origin: '*' }));
 app.use(express.json());
 
