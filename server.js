@@ -9,14 +9,11 @@ const { sync } = require('./scraper');
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// Required for Railway/proxies
-app.set('trust proxy', 1);
+app.set('trust proxy', 1); // Fix for Railway proxy
 
 app.use(helmet({ contentSecurityPolicy: false }));
-app.set('trust proxy', 1); // Required for Railway/reverse proxy
 app.use(cors({ origin: '*' }));
 app.use(express.json());
-
 app.use('/api', rateLimit({
   windowMs: 15 * 60 * 1000,
   max: 200,
@@ -48,7 +45,7 @@ app.get('/api/imoveis', (req, res) => {
       pmax:         req.query.pmax,
       order:        req.query.order,
     };
-    const all = db.getAllProperties(filters);
+    const all  = db.getAllProperties(filters);
     const total = all.length;
     const data  = all.slice((page - 1) * limit, page * limit);
     res.json({ data, meta: { total, page, limit, pages: Math.ceil(total / limit) } });
