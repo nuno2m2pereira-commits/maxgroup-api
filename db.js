@@ -1,78 +1,154 @@
-const Database = require('better-sqlite3');
+/**
+ * Simple JSON file database — no compilation needed, works on any platform.
+ */
+const fs = require('fs');
 const path = require('path');
 
-const DB_PATH = path.join(__dirname, 'data', 'maxgroup.db');
+const DATA_DIR = path.join(__dirname, 'data');
+const PROPS_FILE = path.join(DATA_DIR, 'properties.json');
+const LOGS_FILE = path.join(DATA_DIR, 'sync_logs.json');
 
 // Ensure data directory exists
-const fs = require('fs');
-const dataDir = path.join(__dirname, 'data');
-if (!fs.existsSync(dataDir)) fs.mkdirSync(dataDir, { recursive: true });
+if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
+if (!fs.existsSync(PROPS_FILE)) fs.writeFileSync(PROPS_FILE, JSON.stringify([]));
+if (!fs.existsSync(LOGS_FILE)) fs.writeFileSync(LOGS_FILE, JSON.stringify([]));
 
-const db = new Database(DB_PATH);
+function readProps() {
+  try { return JSON.parse(fs.readFileSync(PROPS_FILE, 'utf8')); }
+  catch { return []; }
+}
 
-// Enable WAL mode for better performance
-db.pragma('journal_mode = WAL');
+function writeProps(data) {
+  fs.writeFileSync(PROPS_FILE, JSON.stringify(data, null, 2));
+}
 
-// Create tables
-db.exec(`
-  CREATE TABLE IF NOT EXISTS properties (
-    id          INTEGER PRIMARY KEY AUTOINCREMENT,
-    ref         TEXT UNIQUE,
-    title       TEXT,
-    type        TEXT,
-    tipologia   TEXT,
-    listing_type TEXT,     -- 'comprar' | 'arrendar'
-    price       REAL,
-    price_str   TEXT,
-    location    TEXT,
-    city        TEXT,
-    district    TEXT,
-    area        TEXT,
-    bedrooms    INTEGER DEFAULT 0,
-    bathrooms   INTEGER DEFAULT 0,
-    description TEXT,
-    agent_name  TEXT,
-    agent_phone TEXT,
-    agent_email TEXT,
-    image_url   TEXT,
-    url         TEXT,
-    active      INTEGER DEFAULT 1,
-    created_at  TEXT DEFAULT (datetime('now')),
-    updated_at  TEXT DEFAULT (datetime('now'))
-  );
+function readLogs() {
+  try { return JSON.parse(fs.readFileSync(LOGS_FILE, 'utf8')); }
+  catch { return []; }
+}
 
-  CREATE TABLE IF NOT EXISTS sync_log (
-    id          INTEGER PRIMARY KEY AUTOINCREMENT,
-    started_at  TEXT DEFAULT (datetime('now')),
-    finished_at TEXT,
-    status      TEXT,
-    added       INTEGER DEFAULT 0,
-    updated     INTEGER DEFAULT 0,
-    removed     INTEGER DEFAULT 0,
-    error       TEXT
-  );
-`);
+function writeLogs(data) {
+  fs.writeFileSync(LOGS_FILE, JSON.stringify(data.slice(-20), null, 2)); // keep last 20
+}
+
+const db = {
+  // ── Properties ──────────────────────────────────────────────────────────
+
+  getAllProperties(filters = {}) {
+    let props = readProps().filter(p => p.active !== false);
+
+    if (filters.listing_type) props = props.filter(p => p.listing_type === filters.listing_type);
+    if (filters.tipologia)    props = props.filter(p => p.tipologia === filters.tipologia);
+    if (filters.city)         props = props.filter(p =>
+      (p.city || '').toLowerCase().includes(filters.city.toLowerCase()) ||
+      (p.location || '').toLowerCase().includes(filters.city.toLowerCase())
+    );
+    if (filters.q) {
+      const q = filters.q.toLowerCase();
+      props = props.filter(p =>
+        (p.title || '').toLowerCase().includes(q) ||
+        (p.location || '').toLowerCase().includes(q) ||
+        (p.city || '').toLowerCase().includes(q) ||
+        (p.description || '').toLowerCase().includes(q)
+      );
+    }
+    if (filters.pmin) props = props.filter(p => p.price >= parseFloat(filters.pmin));
+    if (filters.pmax) props = props.filter(p => p.price <= parseFloat(filters.pmax));
+
+    // Sort
+    if (filters.order === 'price-asc')  props.sort((a, b) => a.price - b.price);
+    if (filters.order === 'price-desc') props.sort((a, b) => b.price - a.price);
+    if (!filters.order || filters.order === 'newest') {
+      props.sort((a, b) => new Date(b.updated_at) - new Date(a.updated_at));
+    }
+
+    return props;
+  },
+
+  getPropertyById(id) {
+    return readProps().find(p => String(p.id) === String(id) && p.active !== false) || null;
+  },
+
+  getPropertyByRef(ref) {
+    return readProps().find(p => p.ref === ref) || null;
+  },
+
+  upsertProperty(prop) {
+    const props = readProps();
+    const idx = props.findIndex(p => p.ref === prop.ref);
+    const now = new Date().toISOString();
+
+    if (idx >= 0) {
+      props[idx] = { ...props[idx], ...prop, active: true, updated_at: now };
+    } else {
+      const newId = props.length > 0 ? Math.max(...props.map(p => p.id || 0)) + 1 : 1;
+      props.push({ id: newId, ...prop, active: true, created_at: now, updated_at: now });
+    }
+    writeProps(props);
+    return idx >= 0 ? 'updated' : 'added';
+  },
+
+  deactivateAbsent(seenRefs) {
+    const props = readProps();
+    const now = new Date().toISOString();
+    let count = 0;
+    props.forEach(p => {
+      if (!seenRefs.has(p.ref) && p.active !== false) {
+        p.active = false;
+        p.updated_at = now;
+        count++;
+      }
+    });
+    writeProps(props);
+    return count;
+  },
+
+  countProperties() {
+    return readProps().filter(p => p.active !== false).length;
+  },
+
+  getStats() {
+    const props = readProps().filter(p => p.active !== false);
+    const cities = {};
+    props.forEach(p => { if (p.city) cities[p.city] = (cities[p.city] || 0) + 1; });
+    const citiesSorted = Object.entries(cities)
+      .sort((a, b) => b[1] - a[1])
+      .slice(0, 10)
+      .map(([city, c]) => ({ city, c }));
+    return {
+      total: props.length,
+      comprar: props.filter(p => p.listing_type === 'comprar').length,
+      arrendar: props.filter(p => p.listing_type === 'arrendar').length,
+      cities: citiesSorted,
+    };
+  },
+
+  // ── Sync logs ────────────────────────────────────────────────────────────
+
+  startSyncLog() {
+    const logs = readLogs();
+    const id = logs.length > 0 ? Math.max(...logs.map(l => l.id)) + 1 : 1;
+    const log = { id, started_at: new Date().toISOString(), status: 'running' };
+    logs.push(log);
+    writeLogs(logs);
+    return id;
+  },
+
+  finishSyncLog(id, result) {
+    const logs = readLogs();
+    const log = logs.find(l => l.id === id);
+    if (log) Object.assign(log, { finished_at: new Date().toISOString(), ...result });
+    writeLogs(logs);
+  },
+
+  getLastSyncLog() {
+    const logs = readLogs();
+    return logs.length > 0 ? logs[logs.length - 1] : null;
+  },
+
+  getSyncLogs() {
+    return readLogs().slice(-5).reverse();
+  },
+};
 
 module.exports = db;
-{
-  "name": "maxgroup-api",
-  "version": "1.0.0",
-  "description": "RE/MAX Maxgroup property listings API with auto-sync",
-  "main": "server.js",
-  "scripts": {
-    "start": "node server.js",
-    "sync": "node scraper.js"
-  },
-  "dependencies": {
-    "axios": "^1.7.2",
-    "cheerio": "^1.0.0",
-    "cors": "^2.8.5",
-    "express": "^4.19.2",
-    "node-cron": "^3.0.3",
-    "helmet": "^7.1.0",
-    "express-rate-limit": "^7.3.1"
-  },
-  "engines": {
-    "node": ">=18.0.0"
-  }
-}
