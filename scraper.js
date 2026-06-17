@@ -1,263 +1,243 @@
 /**
- * Puppeteer-based scraper for maxgroup.pt
- * Renders JavaScript, waits for property cards to load,
- * then extracts all listings including pagination.
+ * Scraper for maxgroup.pt
+ * Uses axios + multiple URL patterns to capture all listings.
  */
 
-const puppeteer = require('puppeteer');
+const axios = require('axios');
+const cheerio = require('cheerio');
 const db = require('./db');
 
 const BASE_URL = 'https://maxgroup.pt';
-const LISTINGS_URL = `${BASE_URL}/pt/imoveis`;
-const DELAY_MS = 2000;
+const DELAY_MS = 1000;
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 
-async function getBrowser() {
-  return puppeteer.launch({
-    headless: 'new',
-    args: [
-      '--no-sandbox',
-      '--disable-setuid-sandbox',
-      '--disable-dev-shm-usage',
-      '--disable-gpu',
-      '--no-first-run',
-      '--no-zygote',
-      '--single-process',
-      '--disable-extensions',
-    ],
-  });
+const HEADERS = {
+  'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+  'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+  'Accept-Language': 'pt-PT,pt;q=0.9,en;q=0.8',
+  'Accept-Encoding': 'gzip, deflate, br',
+  'Connection': 'keep-alive',
+};
+
+// All listing URLs to try (buy + rent + different pages)
+function buildUrls() {
+  const urls = [];
+  // Base listing pages
+  const bases = [
+    `${BASE_URL}/pt/imoveis`,
+    `${BASE_URL}/pt/imoveis/comprar`,
+    `${BASE_URL}/pt/imoveis/arrendar`,
+    `${BASE_URL}/en/properties`,
+    `${BASE_URL}/en/properties/buy`,
+    `${BASE_URL}/en/properties/rent`,
+  ];
+  for (const base of bases) {
+    urls.push(base);
+    for (let p = 2; p <= 10; p++) {
+      urls.push(`${base}?page=${p}`);
+      urls.push(`${base}/page/${p}`);
+    }
+  }
+  return [...new Set(urls)];
 }
 
-/**
- * Extract all property cards from the current page DOM.
- */
-async function extractCards(page) {
-  return page.evaluate((BASE_URL) => {
-    const cards = [];
+function parseCard($, el) {
+  const $el = $(el);
+  const link = $el.find('a[href*="imovel"], a[href*="property"], a[href*="imov"]').first()
+    || $el.find('a').first();
+  const relUrl = link.attr('href') || '';
+  if (!relUrl || relUrl === '#' || relUrl === '/') return null;
+  const url = relUrl.startsWith('http') ? relUrl : BASE_URL + relUrl;
 
-    // Try multiple possible card selectors
+  // Skip non-property links
+  if (!url.includes('imovel') && !url.includes('propert') && !url.includes('/pt/') && !url.includes('/en/')) return null;
+
+  const ref = $el.find('[class*="ref"], .referencia, [class*="codigo"]').first().text().trim()
+    || url.split('/').filter(Boolean).pop()
+    || String(Date.now());
+
+  const title = $el.find('h2, h3, h4, [class*="title"], [class*="titulo"], [class*="tipo"]').first().text().trim();
+  const priceRaw = $el.find('[class*="price"], [class*="preco"], [class*="valor"]').first().text().trim()
+    || $el.find('strong, b').filter((_, e) => $(e).text().includes('€')).first().text().trim();
+  const priceNum = parseFloat((priceRaw || '').replace(/[^0-9]/g, '')) || 0;
+
+  const location = $el.find('[class*="local"], [class*="location"], [class*="cidade"], [class*="morada"]').first().text().trim()
+    || $el.find('address').first().text().trim();
+
+  const imgEl = $el.find('img').first();
+  const imageUrl = imgEl.attr('src') || imgEl.attr('data-src') || imgEl.attr('data-lazy') || '';
+  const fullImage = imageUrl.startsWith('http') ? imageUrl : (imageUrl ? BASE_URL + imageUrl : '');
+
+  const tagText = $el.find('[class*="tag"], [class*="badge"], [class*="negocio"], [class*="tipo-"]').first().text().toLowerCase();
+  const listingType = tagText.includes('arrend') || url.includes('arrend') || url.includes('rent') ? 'arrendar' : 'comprar';
+
+  const tipoMatch = title.match(/T(\d+)/i);
+  const tipologia = tipoMatch ? `T${tipoMatch[1]}` : '';
+  const bedrooms = tipoMatch ? parseInt(tipoMatch[1]) : 0;
+
+  const agentName = $el.find('[class*="agent"], [class*="agente"], [class*="consultor"]').first().text().trim();
+  const agentPhone = $el.find('a[href^="tel"]').first().attr('href')?.replace('tel:', '') || '';
+
+  return {
+    ref, title: title || 'Imóvel',
+    type: title || 'Imóvel', tipologia,
+    listing_type: listingType,
+    price: priceNum, price_str: priceRaw || '—',
+    location: (location.split(',')[0] || location).trim(),
+    city: (location.split(',')[1] || '').trim(),
+    area: '', bedrooms, bathrooms: 0,
+    description: '', agent_name: agentName,
+    agent_phone: agentPhone, agent_email: '',
+    image_url: fullImage, url,
+  };
+}
+
+async function fetchPage(url) {
+  try {
+    const { data, status } = await axios.get(url, { headers: HEADERS, timeout: 15000 });
+    if (status !== 200) return [];
+    const $ = cheerio.load(data);
+
+    // Try selectors from most to least specific
     const selectors = [
-      '.property-item', '.imovel', '.listing-item',
-      '[class*="property"]', '[class*="imovel"]',
+      '.property-item', '.imovel-item', '.listing-item',
+      '[class*="property-card"]', '[class*="imovel-card"]',
+      '.properties-list .item', '.listings .item',
       '.col-md-4', '.col-sm-6', '.col-lg-4',
-      'article', '.card',
+      'article.property', 'article',
+      '.card[class*="prop"]', '.card',
     ];
 
-    let elements = [];
+    let cards = [];
     for (const sel of selectors) {
-      const found = document.querySelectorAll(sel);
-      // Must have price-like content and a link
-      const valid = Array.from(found).filter(el =>
-        el.querySelector('a') &&
-        (el.textContent.includes('€') || el.textContent.includes('Ref') || el.textContent.match(/T\d/))
-      );
-      if (valid.length > 2) { elements = valid; break; }
+      const found = $(sel);
+      if (found.length < 2) continue;
+
+      const parsed = [];
+      found.each((_, el) => {
+        const card = parseCard($, el);
+        if (card) parsed.push(card);
+      });
+
+      if (parsed.length > 1) {
+        cards = parsed;
+        console.log(`  Selector "${sel}" found ${parsed.length} cards`);
+        break;
+      }
     }
 
-    elements.forEach(el => {
-      const link = el.querySelector('a');
-      const url = link ? (link.href.startsWith('http') ? link.href : BASE_URL + link.getAttribute('href')) : '';
-      const ref = el.querySelector('[class*="ref"], .ref')?.textContent.trim()
-        || url.split('/').filter(Boolean).pop() || '';
-
-      const titleEl = el.querySelector('h2, h3, h4, [class*="title"], [class*="tipo"], [class*="type"]');
-      const title = titleEl?.textContent.trim() || '';
-
-      const priceEl = el.querySelector('[class*="price"], [class*="preco"], .price, [class*="valor"]');
-      const priceRaw = priceEl?.textContent.trim() || '';
-      const priceNum = parseFloat(priceRaw.replace(/[^0-9]/g, '')) || 0;
-
-      const locEl = el.querySelector('[class*="local"], [class*="location"], [class*="cidade"], [class*="zone"]');
-      const location = locEl?.textContent.trim() || '';
-
-      const img = el.querySelector('img');
-      const imageUrl = img?.src || img?.dataset?.src || '';
-
-      const tagEl = el.querySelector('[class*="tag"], [class*="badge"], [class*="tipo-negocio"], [class*="estado"]');
-      const tagText = tagEl?.textContent.toLowerCase() || '';
-      const listingType = tagText.includes('arrend') ? 'arrendar' : 'comprar';
-
-      const tipoMatch = title.match(/T(\d+)/i) || url.match(/T(\d+)/i);
-      const tipologia = tipoMatch ? `T${tipoMatch[1]}` : '';
-      const bedrooms = tipoMatch ? parseInt(tipoMatch[1]) : 0;
-
-      const agentEl = el.querySelector('[class*="agent"], [class*="agente"], [class*="consultor"]');
-      const agentName = agentEl?.textContent.trim() || '';
-
-      const phoneEl = el.querySelector('a[href^="tel"]');
-      const agentPhone = phoneEl?.getAttribute('href')?.replace('tel:', '').trim() || '';
-
-      if (url && url !== BASE_URL + '/' && url.length > BASE_URL.length + 3) {
-        cards.push({
-          ref: ref || url.split('/').pop(),
-          title, type: title || 'Imóvel', tipologia,
-          listing_type: listingType,
-          price: priceNum, price_str: priceRaw || '—',
-          location: location.split(',')[0]?.trim() || location,
-          city: location.split(',')[1]?.trim() || location,
-          area: '', bedrooms, bathrooms: 0,
-          description: '', agent_name: agentName,
-          agent_phone: agentPhone, agent_email: '',
-          image_url: imageUrl, url,
-        });
-      }
-    });
+    // Also look for links that look like property detail pages
+    if (cards.length === 0) {
+      $('a[href]').each((_, el) => {
+        const href = $(el).attr('href') || '';
+        if ((href.includes('/imovel/') || href.includes('/property/')) && !href.includes('#')) {
+          const url2 = href.startsWith('http') ? href : BASE_URL + href;
+          const text = $(el).closest('div, article, li').text().trim();
+          if (text.includes('€') || text.match(/T\d/)) {
+            cards.push({
+              ref: href.split('/').pop(),
+              title: $(el).text().trim() || 'Imóvel',
+              type: 'Imóvel', tipologia: '',
+              listing_type: href.includes('arrend') ? 'arrendar' : 'comprar',
+              price: 0, price_str: '—',
+              location: '', city: '',
+              area: '', bedrooms: 0, bathrooms: 0,
+              description: '', agent_name: '',
+              agent_phone: '', agent_email: '',
+              image_url: '', url: url2,
+            });
+          }
+        }
+      });
+    }
 
     return cards;
-  }, BASE_URL);
+  } catch (e) {
+    if (e.response?.status === 404) return null; // page doesn't exist
+    console.error(`  Error fetching ${url}:`, e.message);
+    return [];
+  }
 }
 
-/**
- * Extract detail info from a property page.
- */
-async function extractDetail(page, url) {
+async function fetchDetail(url) {
   try {
-    await page.goto(url, { waitUntil: 'networkidle2', timeout: 20000 });
-    await sleep(1000);
+    const { data } = await axios.get(url, { headers: HEADERS, timeout: 12000 });
+    const $ = cheerio.load(data);
 
-    return page.evaluate(() => {
-      const description = document.querySelector(
-        '[class*="descri"], [class*="description"], [class*="texto"], .desc, [itemprop="description"]'
-      )?.textContent.trim() || '';
+    const description = $('[class*="descri"], [class*="description"], [class*="texto"], [itemprop="description"]')
+      .first().text().trim();
 
-      const areaMatch = document.body.textContent.match(/(\d+[\.,]?\d*)\s*m[²2]/i);
-      const area = areaMatch ? areaMatch[1].replace(',', '.') + 'm²' : '';
+    const bodyText = $('body').text();
+    const areaMatch = bodyText.match(/(\d+[\.,]?\d*)\s*m[²2]/i);
+    const area = areaMatch ? areaMatch[1].replace(',', '.') + 'm²' : '';
 
-      const bathText = document.querySelector('[class*="wc"], [class*="banho"], [class*="bath"]')?.textContent || '';
-      const bathMatch = bathText.match(/\d+/);
-      const bathrooms = bathMatch ? parseInt(bathMatch[0]) : 0;
+    const bathText = $('[class*="wc"], [class*="banho"], [class*="bath"]').first().text();
+    const bathMatch = bathText.match(/\d+/);
+    const bathrooms = bathMatch ? parseInt(bathMatch[0]) : 0;
 
-      const phoneLink = document.querySelector('a[href^="tel"]');
-      const agentPhone = phoneLink?.getAttribute('href')?.replace('tel:', '').trim() || '';
+    const agentPhone = $('a[href^="tel"]').first().attr('href')?.replace('tel:', '').trim() || '';
+    const agentName = $('[class*="agente"], [class*="agent"], [class*="consultor"]').first().text().trim();
+    const agentEmail = $('a[href^="mailto"]').first().attr('href')?.replace('mailto:', '').trim() || '';
+    const imageUrl = $('meta[property="og:image"]').attr('content')
+      || $('[class*="gallery"] img, [class*="foto"] img').first().attr('src') || '';
 
-      const agentEl = document.querySelector('[class*="agente"], [class*="agent"], [class*="consultor"]');
-      const agentName = agentEl?.textContent.trim() || '';
-
-      const emailLink = document.querySelector('a[href^="mailto"]');
-      const agentEmail = emailLink?.getAttribute('href')?.replace('mailto:', '').trim() || '';
-
-      const ogImage = document.querySelector('meta[property="og:image"]')?.getAttribute('content') || '';
-      const galleryImg = document.querySelector('[class*="gallery"] img, [class*="foto"] img, [class*="slider"] img')?.src || '';
-      const imageUrl = ogImage || galleryImg || '';
-
-      return { description, area, bathrooms, agent_phone: agentPhone, agent_name: agentName, agent_email: agentEmail, image_url: imageUrl };
-    });
-  } catch (e) {
-    console.error(`  Detail error for ${url}:`, e.message);
+    return { description, area, bathrooms, agent_phone: agentPhone, agent_name: agentName, agent_email: agentEmail, image_url: imageUrl };
+  } catch {
     return {};
   }
 }
 
-/**
- * Check if there's a next page button and click it, or return false.
- */
-async function goToNextPage(page) {
-  try {
-    const nextBtn = await page.$('a[rel="next"], .pagination .next, [class*="next"]:not([disabled]), a[aria-label="Next"]');
-    if (!nextBtn) return false;
-    await nextBtn.click();
-    await page.waitForNavigation({ waitUntil: 'networkidle2', timeout: 15000 }).catch(() => {});
-    await sleep(DELAY_MS);
-    return true;
-  } catch {
-    return false;
-  }
-}
-
-/**
- * Main sync function.
- */
 async function sync() {
   const logId = db.startSyncLog();
   let added = 0, updated = 0, errors = 0;
-  let browser;
 
   try {
-    console.log('🔄 Starting Puppeteer sync from maxgroup.pt...');
-    browser = await getBrowser();
-    const page = await browser.newPage();
-
-    // Set realistic headers
-    await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36');
-    await page.setViewport({ width: 1366, height: 768 });
-
-    // Block images/fonts to speed up
-    await page.setRequestInterception(true);
-    page.on('request', req => {
-      if (['font', 'stylesheet'].includes(req.resourceType())) {
-        req.abort();
-      } else {
-        req.continue();
-      }
-    });
-
-    console.log(`  Loading: ${LISTINGS_URL}`);
-    await page.goto(LISTINGS_URL, { waitUntil: 'networkidle2', timeout: 30000 });
-    await sleep(DELAY_MS);
-
-    // Accept cookies if banner appears
-    try {
-      const cookieBtn = await page.$('[class*="cookie"] button, #cookie-accept, .accept-cookies');
-      if (cookieBtn) await cookieBtn.click();
-      await sleep(500);
-    } catch {}
-
+    console.log('🔄 Starting sync from maxgroup.pt...');
     const seenRefs = new Set();
-    let pageNum = 1;
+    const allCards = new Map(); // ref -> card (deduplicate)
 
-    while (pageNum <= 20) {
-      console.log(`  Extracting page ${pageNum}...`);
-      const cards = await extractCards(page);
-      console.log(`  Found ${cards.length} properties on page ${pageNum}`);
+    const urls = buildUrls();
+    console.log(`  Will try ${urls.length} URLs...`);
 
-      if (cards.length === 0 && pageNum === 1) {
-        console.log('  ⚠️  No cards found — dumping page title for debug');
-        const title = await page.title();
-        console.log('  Page title:', title);
-      }
-
-      // Open detail page in a second tab for each card
-      const detailPage = await browser.newPage();
-      await detailPage.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36');
-      await detailPage.setRequestInterception(true);
-      detailPage.on('request', req => {
-        if (['font', 'stylesheet', 'image'].includes(req.resourceType())) req.abort();
-        else req.continue();
-      });
+    for (const url of urls) {
+      const cards = await fetchPage(url);
+      if (cards === null) continue; // 404, skip rest of this pattern
+      if (cards.length === 0) { await sleep(300); continue; }
 
       for (const card of cards) {
-        try {
-          seenRefs.add(card.ref);
-          const detail = await extractDetail(detailPage, card.url);
-          const merged = { ...card, ...detail };
-
-          // Clean up undefined/null
-          Object.keys(merged).forEach(k => {
-            if (merged[k] === undefined || merged[k] === null) merged[k] = '';
-          });
-          if (!merged.bedrooms) merged.bedrooms = 0;
-          if (!merged.bathrooms) merged.bathrooms = 0;
-          if (!merged.price) merged.price = 0;
-
-          const result = db.upsertProperty(merged);
-          result === 'added' ? added++ : updated++;
-          console.log(`  ${result === 'added' ? '➕' : '🔄'} ${merged.ref} — ${merged.title || 'untitled'}`);
-        } catch (e) {
-          console.error(`  ⚠️  Error: ${e.message}`);
-          errors++;
+        if (!allCards.has(card.ref)) {
+          allCards.set(card.ref, card);
         }
-        await sleep(800);
       }
-
-      await detailPage.close();
-
-      // Try next page
-      const hasNext = await goToNextPage(page);
-      if (!hasNext) break;
-      pageNum++;
+      console.log(`  Total unique so far: ${allCards.size}`);
+      await sleep(DELAY_MS);
     }
 
-    await browser.close();
+    console.log(`📦 Total unique properties found: ${allCards.size}`);
+
+    // Fetch details for each property
+    for (const [ref, card] of allCards) {
+      try {
+        seenRefs.add(ref);
+        await sleep(800);
+        const detail = await fetchDetail(card.url);
+        const merged = { ...card, ...detail };
+
+        Object.keys(merged).forEach(k => {
+          if (merged[k] === undefined || merged[k] === null) merged[k] = '';
+        });
+        if (!merged.bedrooms) merged.bedrooms = 0;
+        if (!merged.bathrooms) merged.bathrooms = 0;
+        if (!merged.price) merged.price = 0;
+
+        const result = db.upsertProperty(merged);
+        result === 'added' ? added++ : updated++;
+        console.log(`  ${result === 'added' ? '➕' : '🔄'} ${ref} — ${merged.title}`);
+      } catch (e) {
+        console.error(`  ⚠️  Error: ${e.message}`);
+        errors++;
+      }
+    }
 
     const removed = db.deactivateAbsent(seenRefs);
     db.finishSyncLog(logId, { status: 'success', added, updated, removed });
@@ -265,7 +245,6 @@ async function sync() {
     return { added, updated, removed, errors };
 
   } catch (err) {
-    if (browser) await browser.close().catch(() => {});
     db.finishSyncLog(logId, { status: 'error', error: err.message });
     console.error('❌ Sync failed:', err.message);
     throw err;
