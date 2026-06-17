@@ -9,10 +9,19 @@ const { sync } = require('./scraper');
 const app = express();
 const PORT = process.env.PORT || 3000;
 
+// Required for Railway/proxies
+app.set('trust proxy', 1);
+
 app.use(helmet({ contentSecurityPolicy: false }));
 app.use(cors({ origin: '*' }));
 app.use(express.json());
-app.use('/api', rateLimit({ windowMs: 15 * 60 * 1000, max: 200 }));
+
+app.use('/api', rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 200,
+  standardHeaders: true,
+  legacyHeaders: false,
+}));
 
 // Health check
 app.get('/', (req, res) => {
